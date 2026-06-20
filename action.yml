@@ -1,0 +1,146 @@
+name: Setup Terraform (hardened)
+description: >-
+  Install a specific version of Terraform or OpenTofu with checksum, GPG
+  (Terraform), and cosign (OpenTofu) verification, and add it to PATH. No CLI
+  wrapper is installed, so raw exit codes (e.g. plan -detailed-exitcode) are
+  preserved for drift detection.
+author: sethbacon
+branding:
+  icon: terminal
+  color: purple
+
+inputs:
+  binary:
+    description: Which CLI to install — "terraform" or "tofu" (OpenTofu).
+    required: false
+    default: terraform
+  version:
+    description: Version to install (e.g. "1.9.5"), or "latest".
+    required: false
+    default: latest
+  require-checksum:
+    description: Verify the downloaded archive against the published SHA256SUMS.
+    required: false
+    default: "true"
+  require-gpg-signature:
+    description: >-
+      Terraform only — verify SHA256SUMS against HashiCorp's GPG signature.
+      The HashiCorp public key is fetched from its well-known URL and its
+      fingerprint is asserted before use.
+    required: false
+    default: "false"
+  require-cosign-verification:
+    description: >-
+      OpenTofu only — verify SHA256SUMS with cosign against the OpenTofu release
+      identity. Requires the cosign CLI on PATH (e.g. sigstore/cosign-installer).
+    required: false
+    default: "false"
+
+outputs:
+  version:
+    description: The resolved version that was installed.
+    value: ${{ steps.install.outputs.version }}
+  path:
+    description: Directory the binary was installed into (also added to PATH).
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        BINARY: ${{ inputs.binary }}
+        VERSION_IN: ${{ inputs.version }}
+        REQUIRE_CHECKSUM: ${{ inputs.require-checksum }}
+        REQUIRE_GPG: ${{ inputs.require-gpg-signature }}
+        REQUIRE_COSIGN: ${{ inputs.require-cosign-verification }}
+      run: |
+        set -euo pipefail
+        # HashiCorp release-signing key fingerprint (asserted before trusting it).
+        HASHICORP_FPR="C874011F0AB405110D0210553436 5D9472D7468F"
+        HASHICORP_FPR="${HASHICORP_FPR// /}"
+
+        case "$BINARY" in terraform|tofu) : ;; *) echo "::error::binary must be 'terraform' or 'tofu'"; exit 1 ;; esac
+
+        # --- platform mapping (Terraform/OpenTofu use the same os/arch names) ---
+        os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        case "$os" in linux) os=linux ;; darwin) os=darwin ;; mingw*|msys*|cygwin*) os=windows ;; *) echo "::error::unsupported OS $os"; exit 1 ;; esac
+        arch="$(uname -m)"
+        case "$arch" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) echo "::error::unsupported arch $arch"; exit 1 ;; esac
+
+        work="$(mktemp -d)"; cd "$work"
+
+        # --- resolve "latest" ---
+        version="$VERSION_IN"
+        if [ "$version" = "latest" ] || [ -z "$version" ]; then
+          if [ "$BINARY" = "terraform" ]; then
+            version="$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+          else
+            version="$(curl -fsSL https://api.github.com/repos/opentofu/opentofu/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            version="${version#v}"
+          fi
+        fi
+        version="${version#v}"
+        [ -n "$version" ] || { echo "::error::could not resolve version"; exit 1; }
+        echo "Installing $BINARY $version ($os/$arch)"
+
+        # --- URLs ---
+        if [ "$BINARY" = "terraform" ]; then
+          base="https://releases.hashicorp.com/terraform/${version}"
+          zip="terraform_${version}_${os}_${arch}.zip"
+          sums="terraform_${version}_SHA256SUMS"
+          sig="terraform_${version}_SHA256SUMS.sig"
+        else
+          base="https://github.com/opentofu/opentofu/releases/download/v${version}"
+          zip="tofu_${version}_${os}_${arch}.zip"
+          sums="tofu_${version}_SHA256SUMS"
+          sig="tofu_${version}_SHA256SUMS.sig"
+        fi
+
+        curl -fsSL -o "$zip" "${base}/${zip}"
+        curl -fsSL -o "$sums" "${base}/${sums}"
+
+        # --- checksum ---
+        if [ "$REQUIRE_CHECKSUM" = "true" ]; then
+          grep " ${zip}\$" "$sums" | sha256sum -c -
+          echo "checksum OK"
+        fi
+
+        # --- GPG (terraform) ---
+        if [ "$REQUIRE_GPG" = "true" ]; then
+          if [ "$BINARY" != "terraform" ]; then echo "::error::require-gpg-signature applies to terraform only; use require-cosign-verification for tofu"; exit 1; fi
+          curl -fsSL -o "$sig" "${base}/${sig}"
+          curl -fsSL -o hashicorp.asc "https://www.hashicorp.com/.well-known/pgp-key.txt"
+          export GNUPGHOME="$work/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+          gpg --batch --import hashicorp.asc
+          got="$(gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/{print $10; exit}')"
+          if [ "$got" != "$HASHICORP_FPR" ]; then echo "::error::HashiCorp GPG fingerprint mismatch (got $got)"; exit 1; fi
+          gpg --batch --verify "$sig" "$sums"
+          echo "GPG signature OK"
+        fi
+
+        # --- cosign (tofu) ---
+        if [ "$REQUIRE_COSIGN" = "true" ]; then
+          if [ "$BINARY" != "tofu" ]; then echo "::error::require-cosign-verification applies to tofu only; use require-gpg-signature for terraform"; exit 1; fi
+          command -v cosign >/dev/null 2>&1 || { echo "::error::cosign not found on PATH. Add sigstore/cosign-installer before this step."; exit 1; }
+          curl -fsSL -o "${sums}.sig" "${base}/${sums}.sig"
+          curl -fsSL -o "${sums}.pem" "${base}/${sums}.pem" || true
+          cosign verify-blob \
+            --certificate "${sums}.pem" \
+            --signature "${sums}.sig" \
+            --certificate-identity-regexp 'https://github.com/opentofu/opentofu' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$sums"
+          echo "cosign verification OK"
+        fi
+
+        # --- install ---
+        dest="${RUNNER_TEMP:-/tmp}/${BINARY}-${version}"
+        mkdir -p "$dest"
+        unzip -o -q "$zip" -d "$dest"
+        chmod +x "$dest/${BINARY}"* 2>/dev/null || true
+        echo "$dest" >> "$GITHUB_PATH"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "path=$dest" >> "$GITHUB_OUTPUT"
+        echo "Installed $BINARY $version to $dest"
