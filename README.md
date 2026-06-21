@@ -1,5 +1,8 @@
 # setup-terraform-hardened
 
+[![GitHub release](https://img.shields.io/github/v/release/sethbacon/setup-terraform-hardened?logo=github&label=Marketplace&color=2ea44f)](https://github.com/marketplace/actions/setup-terraform-hardened)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Install Terraform **or** OpenTofu with supply-chain verification, and add it to
 PATH. No CLI wrapper is installed, so raw exit codes (e.g.
 `plan -detailed-exitcode`) are preserved for drift detection.
