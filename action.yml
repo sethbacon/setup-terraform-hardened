@@ -1,9 +1,5 @@
 name: Setup Terraform (hardened)
-description: >-
-  Install a specific version of Terraform or OpenTofu with checksum, GPG
-  (Terraform), and cosign (OpenTofu) verification, and add it to PATH. No CLI
-  wrapper is installed, so raw exit codes (e.g. plan -detailed-exitcode) are
-  preserved for drift detection.
+description: Install Terraform or OpenTofu with checksum, GPG, and cosign verification; no CLI wrapper, so raw exit codes are preserved.
 author: sethbacon
 branding:
   icon: terminal
