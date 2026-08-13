@@ -1,5 +1,5 @@
 name: Setup Terraform (hardened)
-description: Install Terraform or OpenTofu with checksum, GPG, and cosign verification; no CLI wrapper, so raw exit codes are preserved.
+description: Install Terraform or OpenTofu with signature verification on by default; no CLI wrapper, so raw exit codes are kept.
 author: sethbacon
 branding:
   icon: terminal
@@ -15,22 +15,29 @@ inputs:
     required: false
     default: latest
   require-checksum:
-    description: Verify the downloaded archive against the published SHA256SUMS.
+    description: >-
+      Verify the downloaded archive against the published SHA256SUMS. Always
+      performed when signature verification runs, because the signature covers
+      SHA256SUMS and nothing else links it to the archive.
     required: false
     default: "true"
   require-gpg-signature:
     description: >-
-      Terraform only — verify SHA256SUMS against HashiCorp's GPG signature.
-      The HashiCorp public key is fetched from its well-known URL and its
-      fingerprint is asserted before use.
+      Terraform only — verify SHA256SUMS against HashiCorp's GPG signature, using
+      the public key vendored at keys/hashicorp.asc. The signature is accepted only
+      if gpg reports it was made by the pinned HashiCorp release key. "auto" (the
+      default) means "true" for terraform and "false" for tofu; "false" opts out of
+      authenticity checking and emits a warning.
     required: false
-    default: "false"
+    default: auto
   require-cosign-verification:
     description: >-
       OpenTofu only — verify SHA256SUMS with cosign against the OpenTofu release
       identity. Requires the cosign CLI on PATH (e.g. sigstore/cosign-installer).
+      "auto" (the default) means "true" for tofu and "false" for terraform; "false"
+      opts out of authenticity checking and emits a warning.
     required: false
-    default: "false"
+    default: auto
 
 outputs:
   version:
@@ -53,11 +60,48 @@ runs:
         REQUIRE_COSIGN: ${{ inputs.require-cosign-verification }}
       run: |
         set -euo pipefail
-        # HashiCorp release-signing key fingerprint (asserted before trusting it).
-        HASHICORP_FPR="C874011F0AB405110D0210553436 5D9472D7468F"
-        HASHICORP_FPR="${HASHICORP_FPR// /}"
 
+        # --- pinned trust roots ---
+        # HashiCorp release-signing key. SHA256SUMS is signed by this key's [S]
+        # subkey, so a signature is accepted only when gpg reports this fingerprint
+        # as the signing key itself or as the signing key's primary key.
+        HASHICORP_FPR="C874011F0AB405110D02105534365D9472D7468F"
+        # OpenTofu release identity. Anchored on purpose: an unanchored pattern also
+        # matches identities such as https://github.com/opentofu/opentofu-evil/... .
+        COSIGN_IDENTITY_RE='^https://github\.com/opentofu/opentofu/\.github/workflows/release\.yml@refs/'
+        COSIGN_ISSUER="https://token.actions.githubusercontent.com"
+
+        curl_get() { curl -fsSL --proto '=https' --proto-redir '=https' --max-time 300 --retry 3 "$@"; }
+
+        # --- input validation (a typo must not silently disable a check) ---
         case "$BINARY" in terraform|tofu) : ;; *) echo "::error::binary must be 'terraform' or 'tofu'"; exit 1 ;; esac
+        case "$REQUIRE_CHECKSUM" in true|false) : ;; *) echo "::error::require-checksum must be 'true' or 'false' (got '$REQUIRE_CHECKSUM')"; exit 1 ;; esac
+        case "$REQUIRE_GPG" in true|false|auto) : ;; *) echo "::error::require-gpg-signature must be 'true', 'false' or 'auto' (got '$REQUIRE_GPG')"; exit 1 ;; esac
+        case "$REQUIRE_COSIGN" in true|false|auto) : ;; *) echo "::error::require-cosign-verification must be 'true', 'false' or 'auto' (got '$REQUIRE_COSIGN')"; exit 1 ;; esac
+
+        # "auto" means "required for the binary this mechanism applies to": Terraform's
+        # trust root is HashiCorp's GPG-signed SHA256SUMS, OpenTofu's is cosign against
+        # the OpenTofu release identity. This is what makes the default fail closed.
+        if [ "$REQUIRE_GPG" = "auto" ]; then
+          if [ "$BINARY" = "terraform" ]; then REQUIRE_GPG=true; else REQUIRE_GPG=false; fi
+        fi
+        if [ "$REQUIRE_COSIGN" = "auto" ]; then
+          if [ "$BINARY" = "tofu" ]; then REQUIRE_COSIGN=true; else REQUIRE_COSIGN=false; fi
+        fi
+        if [ "$REQUIRE_GPG" = "true" ] && [ "$BINARY" != "terraform" ]; then echo "::error::require-gpg-signature applies to terraform only; use require-cosign-verification for tofu"; exit 1; fi
+        if [ "$REQUIRE_COSIGN" = "true" ] && [ "$BINARY" != "tofu" ]; then echo "::error::require-cosign-verification applies to tofu only; use require-gpg-signature for terraform"; exit 1; fi
+
+        if [ "$REQUIRE_GPG" = "true" ] || [ "$REQUIRE_COSIGN" = "true" ]; then
+          if [ "$REQUIRE_CHECKSUM" != "true" ]; then
+            echo "::warning::require-checksum=false ignored: the signature covers SHA256SUMS only, so the archive is still compared against it"
+            REQUIRE_CHECKSUM=true
+          fi
+        else
+          echo "::warning::signature verification is disabled for $BINARY: SHA256SUMS is fetched from the same origin as the archive, so this run proves transfer integrity, not authenticity"
+          if [ "$REQUIRE_CHECKSUM" != "true" ]; then
+            echo "::warning::require-checksum=false: the downloaded archive is not verified at all"
+          fi
+        fi
 
         # --- platform mapping (Terraform/OpenTofu use the same os/arch names) ---
         os="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -71,9 +115,9 @@ runs:
         version="$VERSION_IN"
         if [ "$version" = "latest" ] || [ -z "$version" ]; then
           if [ "$BINARY" = "terraform" ]; then
-            version="$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            version="$(curl_get https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | head -1 | cut -d'"' -f4)"
           else
-            version="$(curl -fsSL https://api.github.com/repos/opentofu/opentofu/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            version="$(curl_get https://api.github.com/repos/opentofu/opentofu/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)"
             version="${version#v}"
           fi
         fi
@@ -94,41 +138,54 @@ runs:
           sig="tofu_${version}_SHA256SUMS.sig"
         fi
 
-        curl -fsSL -o "$zip" "${base}/${zip}"
-        curl -fsSL -o "$sums" "${base}/${sums}"
+        curl_get -o "$zip" "${base}/${zip}"
+        curl_get -o "$sums" "${base}/${sums}"
 
-        # --- checksum ---
-        if [ "$REQUIRE_CHECKSUM" = "true" ]; then
-          grep " ${zip}\$" "$sums" | sha256sum -c -
-          echo "checksum OK"
-        fi
-
-        # --- GPG (terraform) ---
+        # --- GPG (terraform): authenticate SHA256SUMS before it is trusted ---
         if [ "$REQUIRE_GPG" = "true" ]; then
-          if [ "$BINARY" != "terraform" ]; then echo "::error::require-gpg-signature applies to terraform only; use require-cosign-verification for tofu"; exit 1; fi
-          curl -fsSL -o "$sig" "${base}/${sig}"
-          curl -fsSL -o hashicorp.asc "https://www.hashicorp.com/.well-known/pgp-key.txt"
-          export GNUPGHOME="$work/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-          gpg --batch --import hashicorp.asc
-          got="$(gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/{print $10; exit}')"
-          if [ "$got" != "$HASHICORP_FPR" ]; then echo "::error::HashiCorp GPG fingerprint mismatch (got $got)"; exit 1; fi
-          gpg --batch --verify "$sig" "$sums"
-          echo "GPG signature OK"
+          command -v gpg >/dev/null 2>&1 || { echo "::error::gpg not found on PATH, so SHA256SUMS cannot be authenticated. Install gnupg on the runner, or set require-gpg-signature: 'false' to install without authenticity checking."; exit 1; }
+          curl_get -o "$sig" "${base}/${sig}" || { echo "::error::could not download ${sig}; SHA256SUMS cannot be authenticated"; exit 1; }
+          key="${GITHUB_ACTION_PATH:-}/keys/hashicorp.asc"
+          [ -f "$key" ] || { echo "::error::vendored HashiCorp public key not found at ${key}"; exit 1; }
+          GNUPGHOME="$work/gnupg"; export GNUPGHOME
+          mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+          gpg --batch --quiet --import "$key"
+          # Bind the pin to the key that actually made the signature. gpg reports the
+          # signing key ($3) and its primary key ($12) on the VALIDSIG status line, so
+          # an extra key in the keyring cannot satisfy the pin for someone else's
+          # signature — which is what checking only the first fpr: record allowed.
+          status="$(gpg --batch --status-fd=1 --verify "$sig" "$sums" 2>/dev/null)" || {
+            echo "::error::GPG verification of ${sums} failed"
+            exit 1
+          }
+          printf '%s\n' "$status" | grep -q '^\[GNUPG:\] GOODSIG ' || { echo "::error::no good GPG signature over ${sums} (expired or revoked signing key?)"; exit 1; }
+          sig_fpr="$(printf '%s\n' "$status" | awk '$1=="[GNUPG:]" && $2=="VALIDSIG" {print $3; exit}')"
+          pri_fpr="$(printf '%s\n' "$status" | awk '$1=="[GNUPG:]" && $2=="VALIDSIG" && NF>=12 {print $12; exit}')"
+          if [ "$sig_fpr" != "$HASHICORP_FPR" ] && [ "$pri_fpr" != "$HASHICORP_FPR" ]; then
+            echo "::error::${sums} was signed by ${sig_fpr:-unknown} (primary ${pri_fpr:-unknown}), not the pinned HashiCorp key ${HASHICORP_FPR}"
+            exit 1
+          fi
+          echo "GPG signature OK (signing key ${sig_fpr}, primary ${pri_fpr:-n/a})"
         fi
 
-        # --- cosign (tofu) ---
+        # --- cosign (tofu): authenticate SHA256SUMS before it is trusted ---
         if [ "$REQUIRE_COSIGN" = "true" ]; then
-          if [ "$BINARY" != "tofu" ]; then echo "::error::require-cosign-verification applies to tofu only; use require-gpg-signature for terraform"; exit 1; fi
-          command -v cosign >/dev/null 2>&1 || { echo "::error::cosign not found on PATH. Add sigstore/cosign-installer before this step."; exit 1; }
-          curl -fsSL -o "${sums}.sig" "${base}/${sums}.sig"
-          curl -fsSL -o "${sums}.pem" "${base}/${sums}.pem" || true
+          command -v cosign >/dev/null 2>&1 || { echo "::error::cosign not found on PATH. Add sigstore/cosign-installer before this step, or set require-cosign-verification: 'false' to install without authenticity checking."; exit 1; }
+          curl_get -o "${sums}.sig" "${base}/${sums}.sig" || { echo "::error::could not download ${sums}.sig; SHA256SUMS cannot be authenticated"; exit 1; }
+          curl_get -o "${sums}.pem" "${base}/${sums}.pem" || { echo "::error::could not download ${sums}.pem; SHA256SUMS cannot be authenticated"; exit 1; }
           cosign verify-blob \
             --certificate "${sums}.pem" \
             --signature "${sums}.sig" \
-            --certificate-identity-regexp 'https://github.com/opentofu/opentofu' \
-            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
+            --certificate-oidc-issuer "$COSIGN_ISSUER" \
             "$sums"
           echo "cosign verification OK"
+        fi
+
+        # --- checksum: the only link between the authenticated SHA256SUMS and the archive ---
+        if [ "$REQUIRE_CHECKSUM" = "true" ]; then
+          grep " ${zip}\$" "$sums" | sha256sum -c -
+          echo "checksum OK"
         fi
 
         # --- install ---

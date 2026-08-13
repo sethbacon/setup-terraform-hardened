@@ -15,3 +15,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Parse action.yml
         run: python3 -c "import yaml; d=yaml.safe_load(open('action.yml')); assert d['runs']['using']=='composite'; print('OK', d['name'])"
+
+  behaviour:
+    name: Action script behaviour
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - name: Run action script tests
+        run: tests/run-tests.sh
