@@ -1,0 +1,113 @@
+---
+name: Release
+
+# Cuts a release for a pushed v*.*.* tag, and only after the tag's own tree has
+# passed the same checks main does.
+#
+# The gap this closes: CI fired only on push/pull_request to main, so a tag
+# could be created at any commit and consumers resolving `@v1` would execute
+# whatever that commit carried, with no gate having looked at it. A composite
+# action is executed verbatim by every consumer, so the tag IS the artifact.
+"on":
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Serialise so two tag pushes cannot race the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Unprivileged: re-runs the gate against the tagged tree. Holds no
+  # release/attestation permissions, so nothing here can publish.
+  verify:
+    name: Verify the tagged tree
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so the ancestry check below can walk back to main.
+          fetch-depth: 0
+
+      # A release must not be cuttable from a ref that never went through main's
+      # review. This is the in-repo half; branch protection is the other half.
+      - name: Verify the tag is reachable from main
+        run: |
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::The tagged commit is not reachable from main. Refusing to release an unmerged ref."
+            exit 1
+          fi
+
+      - name: Validate action.yml
+        run: python3 -c "import yaml; d=yaml.safe_load(open('action.yml')); assert d['runs']['using']=='composite'; print('OK', d['name'])"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Run action script tests
+        run: tests/run-tests.sh
+
+  # Minimal privileged job: creates the release and attests the tagged tree.
+  release:
+    name: Publish release + provenance
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # provenance signing
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The consumer executes action.yml and the vendored trust root, so those
+      # are the bytes worth binding provenance to.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            action.yml
+            keys/hashicorp.asc
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --generate-notes
+
+      # Moving the floating major alias is what actually changes what every
+      # `@v1` consumer executes, so it happens here, after the gate rather than
+      # by hand. Moved through the API rather than `git push`: checkout runs with
+      # persist-credentials: false, so the working copy holds no credential to
+      # push with. GH_TOKEN carries the job's `contents: write`.
+      - name: Move the floating major alias
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          MAJOR="${TAG%%.*}"
+          if gh api "repos/$REPO/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$MAJOR" -f sha="$SHA" -F force=true
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$MAJOR" -f sha="$SHA"
+          fi
+          echo "Moved $MAJOR -> $SHA"
