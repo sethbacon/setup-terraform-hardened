@@ -71,7 +71,20 @@ runs:
         COSIGN_IDENTITY_RE='^https://github\.com/opentofu/opentofu/\.github/workflows/release\.yml@refs/'
         COSIGN_ISSUER="https://token.actions.githubusercontent.com"
 
-        curl_get() { curl -fsSL --proto '=https' --proto-redir '=https' --max-time 300 --retry 3 "$@"; }
+        # --connect-timeout bounds the handshake and --max-time the whole
+        # transfer: without the latter a peer that connects and then trickles
+        # holds the step open until the job timeout (360 min by default), and
+        # -s hides the stalled progress meter that would have shown it.
+        # --retry-all-errors is what makes --retry cover a dropped connection
+        # rather than only an HTTP status. --max-redirs bounds a redirect chain
+        # that --proto-redir already pins to https.
+        curl_get() {
+          curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 3 \
+            --connect-timeout 10 --max-time 300 --retry 3 --retry-delay 2 --retry-all-errors "$@"
+        }
+        # The two version-API responses are a few KB and are read into a command
+        # substitution, i.e. into memory, so they get a size ceiling as well.
+        curl_get_small() { curl_get --max-filesize 1048576 "$@"; }
 
         # --- input validation (a typo must not silently disable a check) ---
         case "$BINARY" in terraform|tofu) : ;; *) echo "::error::binary must be 'terraform' or 'tofu'"; exit 1 ;; esac
@@ -115,14 +128,21 @@ runs:
         version="$VERSION_IN"
         if [ "$version" = "latest" ] || [ -z "$version" ]; then
           if [ "$BINARY" = "terraform" ]; then
-            version="$(curl_get https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            version="$(curl_get_small https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | head -1 | cut -d'"' -f4)"
           else
-            version="$(curl_get https://api.github.com/repos/opentofu/opentofu/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            version="$(curl_get_small https://api.github.com/repos/opentofu/opentofu/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)"
             version="${version#v}"
           fi
         fi
         version="${version#v}"
         [ -n "$version" ] || { echo "::error::could not resolve version"; exit 1; }
+        # $version is spliced into the download URLs AND written to
+        # $GITHUB_OUTPUT, both of which are line-oriented. An action input can
+        # legally be multi-line, so assert the shape rather than relying on a
+        # later step happening to fail first.
+        case "$version" in
+          *[!A-Za-z0-9._+-]*|"") echo "::error::version must contain only letters, digits, dot, underscore, plus or hyphen (got '$version')"; exit 1 ;;
+        esac
         echo "Installing $BINARY $version ($os/$arch)"
 
         # --- URLs ---
@@ -189,11 +209,38 @@ runs:
         fi
 
         # --- install ---
+        # $GITHUB_PATH PREPENDS its entry, so whatever lands in $dest sits ahead
+        # of /usr/bin for every later step in the consumer's job. Extract to a
+        # scratch directory and install ONLY the binary this action claims to
+        # install: an archive carrying an extra entry named git, node, bash or
+        # sudo would otherwise shadow the real tool in steps that never invoke
+        # terraform at all, and a composite action has no `post:` hook to revoke
+        # the PATH entry with. `rm -rf` first because `mkdir -p` ADOPTS an
+        # existing directory, and `unzip -o` only overwrites entries that are in
+        # the archive, so a stale file would survive into PATH.
+        exe="${BINARY}"
+        [ "$os" = "windows" ] && exe="${BINARY}.exe"
+        rm -rf "$work/x"
+        unzip -o -q "$zip" -d "$work/x"
+        [ -f "$work/x/$exe" ] || { echo "::error::archive did not contain the expected ${exe} binary"; exit 1; }
         dest="${RUNNER_TEMP:-/tmp}/${BINARY}-${version}"
+        rm -rf "$dest"
         mkdir -p "$dest"
-        unzip -o -q "$zip" -d "$dest"
-        chmod +x "$dest/${BINARY}"* 2>/dev/null || true
-        echo "$dest" >> "$GITHUB_PATH"
-        echo "version=$version" >> "$GITHUB_OUTPUT"
-        echo "path=$dest" >> "$GITHUB_OUTPUT"
-        echo "Installed $BINARY $version to $dest"
+        install -m 0755 "$work/x/$exe" "$dest/$exe"
+
+        # $GITHUB_PATH is parsed line by line and has no delimiter form, so a
+        # newline here forges an extra directory onto PATH for every later step.
+        case "$dest" in
+          *[!-A-Za-z0-9._/+]*) echo "::error::refusing to add an install path with unexpected characters to PATH"; exit 1 ;;
+        esac
+        printf '%s\n' "$dest" >> "$GITHUB_PATH"
+
+        # Delimiter form: `key=value` is only safe for a value that provably
+        # cannot contain a newline. The delimiter is random so a value cannot
+        # close its own heredoc and forge a second output.
+        delim="ghout-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        {
+          printf 'version<<%s\n%s\n%s\n' "$delim" "$version" "$delim"
+          printf 'path<<%s\n%s\n%s\n' "$delim" "$dest" "$delim"
+        } >> "$GITHUB_OUTPUT"
+        echo "Installed $BINARY $version to $dest/$exe"

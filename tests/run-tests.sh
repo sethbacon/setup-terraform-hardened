@@ -70,7 +70,10 @@ mkdir -p "$T/bin" "$T/bin-cosign"
 cat >"$T/bin/curl" <<'SH'
 #!/usr/bin/env bash
 # curl double: serves $FIXTURES/<basename of URL>, exits 22 when it is absent.
+# Records its full argv to $CURL_ARGV_LOG when set, so the flags the action
+# actually passes can be asserted from an observed invocation.
 set -uo pipefail
+[ -n "${CURL_ARGV_LOG:-}" ] && printf '%s\n' "$*" >>"$CURL_ARGV_LOG"
 out=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -144,6 +147,32 @@ GOOD_SUB_FPR="$(gpg --batch --with-colons --list-keys --with-subkey-fingerprints
 gpg --batch --quiet --armor --export good@test.invalid >"$T/good.asc"
 gpg --batch --quiet --armor --export evil@test.invalid >"$T/evil.asc"
 cat "$T/good.asc" "$T/evil.asc" >"$T/good-plus-evil.asc"
+
+# mkfix_extra <fixture-dir> <binary> <version> <extra-name>
+#   Same as mkfix, but the archive also carries <extra-name> — the shape a
+#   tampered release would use to shadow a tool on the consumer's PATH.
+mkfix_extra() {
+  local dir="$1" bin="$2" ver="$3" extra="$4" stage
+  rm -rf "$dir"; mkdir -p "$dir"
+  stage="$T/stage.$((++SEQ))"; mkdir -p "$stage"
+  printf '#!/bin/sh\necho fake %s\n' "$bin" >"$stage/$bin"
+  printf '#!/bin/sh\necho SHADOWED\n' >"$stage/$extra"
+  chmod +x "$stage/$bin" "$stage/$extra"
+  (cd "$stage" && zip -q "$dir/${bin}_${ver}_${OS}_${ARCH}.zip" "$bin" "$extra")
+  (cd "$dir" && sha256sum "${bin}_${ver}_${OS}_${ARCH}.zip" >"${bin}_${ver}_SHA256SUMS")
+}
+
+# mkfix_missing <fixture-dir> <binary> <version>
+#   An archive that does NOT contain the binary the action claims to install.
+mkfix_missing() {
+  local dir="$1" bin="$2" ver="$3" stage
+  rm -rf "$dir"; mkdir -p "$dir"
+  stage="$T/stage.$((++SEQ))"; mkdir -p "$stage"
+  printf '#!/bin/sh\necho SHADOWED\n' >"$stage/git"
+  chmod +x "$stage/git"
+  (cd "$stage" && zip -q "$dir/${bin}_${ver}_${OS}_${ARCH}.zip" git)
+  (cd "$dir" && sha256sum "${bin}_${ver}_${OS}_${ARCH}.zip" >"${bin}_${ver}_SHA256SUMS")
+}
 
 # mkfix <fixture-dir> <binary> <version>  -> archive + SHA256SUMS
 mkfix() {
@@ -292,7 +321,12 @@ expect_ok "good path: signature by the pinned key installs" \
   'GPG signature OK' 'checksum OK' "Installed terraform $V"
 grep -q "terraform-$V" "$LAST/github_path" ||
   fail "good path adds the install dir to GITHUB_PATH" "github_path is $(cat "$LAST/github_path")"
-grep -q "version=$V" "$LAST/github_output" ||
+# Outputs are written in the random-delimiter heredoc form, so the value sits
+# on its own line between two delimiter lines rather than after a `=`.
+awk -v want="$V" '
+  /^version<<ghout-/ { d = substr($0, index($0, "<<") + 2); getline v; if (v == want) ok = 1 }
+  END { exit ok ? 0 : 1 }
+' "$LAST/github_output" ||
   fail "good path sets the version output" "github_output is $(cat "$LAST/github_output")"
 
 F="$T/fx-good-subkey"
@@ -452,6 +486,155 @@ if [ "$STATUS" -ne 0 ] && ! printf '%s\n' "$OUT" | grep -q 'Installed'; then
   pass "an unparseable release feed stops the install"
 else
   fail "an unparseable release feed stops the install" "exit $STATUS: $OUT"
+fi
+
+# ---------------------------------------------------- install hygiene (#3) --
+# $GITHUB_PATH PREPENDS, so the install directory sits ahead of /usr/bin for
+# every later step in the consumer's job. The property under test is that the
+# consumer receives exactly ONE vetted file, whatever the archive contained.
+note "install hygiene"
+WITH_COSIGN=0
+use_pin "$GOOD_FPR"
+
+# Table: <case> <fixture-builder> <extra-entry> <expectation>
+F="$T/fx-extra"
+mkfix_extra "$F" terraform 1.9.5 git
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+if [ "$STATUS" -eq 0 ]; then
+  d="$(head -1 "$LAST/github_path")"
+  if [ -e "$d/git" ]; then
+    fail "an extra archive entry never reaches the consumer's PATH" "$d/git exists and would shadow git"
+  elif [ ! -x "$d/terraform" ]; then
+    fail "an extra archive entry never reaches the consumer's PATH" "terraform missing from $d"
+  elif [ "$(find "$d" -type f | wc -l)" -ne 1 ]; then
+    fail "an extra archive entry never reaches the consumer's PATH" "expected exactly 1 file in $d, found: $(find "$d" -type f | tr '\n' ' ')"
+  else
+    pass "an extra archive entry never reaches the consumer's PATH"
+  fi
+else
+  fail "an extra archive entry never reaches the consumer's PATH" "exit $STATUS: $(printf '%s' "$OUT" | tail -2 | tr '\n' '|')"
+fi
+
+F="$T/fx-missing"
+mkfix_missing "$F" terraform 1.9.5
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+expect_fail "an archive without the expected binary stops the install" \
+  '::error::archive did not contain the expected terraform binary'
+
+# mkdir -p ADOPTS an existing directory and unzip -o only overwrites entries
+# that are in the archive, so a stale file used to survive into PATH.
+F="$T/fx-stale"
+mkfix "$F" terraform 1.9.5
+rt_pre="$T/pre-install"
+mkdir -p "$rt_pre/install/terraform-1.9.5"
+printf '#!/bin/sh\necho STALE\n' >"$rt_pre/install/terraform-1.9.5/node"
+chmod +x "$rt_pre/install/terraform-1.9.5/node"
+set +e
+env PATH="$T/bin:$BASE_PATH" FIXTURES="$F" GITHUB_ACTION_PATH="$GOOD_DIR" \
+  GITHUB_PATH="$rt_pre/github_path" GITHUB_OUTPUT="$rt_pre/github_output" \
+  RUNNER_TEMP="$rt_pre/install" GNUPGHOME= \
+  BINARY=terraform VERSION_IN=1.9.5 REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false \
+  bash "$SCRIPT" >"$rt_pre/out" 2>&1
+st=$?
+set -e
+if [ "$st" -eq 0 ] && [ ! -e "$rt_pre/install/terraform-1.9.5/node" ]; then
+  pass "a pre-existing file in the install directory does not survive into PATH"
+else
+  fail "a pre-existing file in the install directory does not survive into PATH" \
+    "exit $st; node still present: $([ -e "$rt_pre/install/terraform-1.9.5/node" ] && echo yes || echo no)"
+fi
+
+# ------------------------------------------ runner file-command boundary (#4) --
+# $GITHUB_PATH and $GITHUB_OUTPUT are parsed line by line. The primary control
+# is the version shape assertion; the delimiter form is the second layer.
+note "runner file-command boundary"
+F="$T/fx-boundary"
+mkfix "$F" terraform 1.9.5
+
+# Table: every version an action input can legally carry that must be refused.
+for bad_case in \
+  'newline:1.9.5
+path=/evil' \
+  'carriage-return:1.9.5\rpath=/evil' \
+  'space:1.9.5 evil' \
+  'semicolon:1.9.5;id' \
+  'slash:1.9.5/../../etc'
+do
+  label="${bad_case%%:*}"; val="${bad_case#*:}"
+  val="$(printf '%b' "$val")"
+  run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN="$val" \
+    REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+  if [ "$STATUS" -ne 0 ] && printf '%s\n' "$OUT" | grep -q '::error::version must contain only'; then
+    pass "version with a $label is refused"
+  else
+    fail "version with a $label is refused" "exit $STATUS: $(printf '%s' "$OUT" | tail -2 | tr '\n' '|')"
+  fi
+done
+
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+if [ "$STATUS" -eq 0 ]; then
+  # Exactly the two documented outputs, each in delimiter form, and no forged
+  # third key. Counting `<<` keys is what distinguishes the safe form.
+  keys="$(grep -c '<<ghout-' "$LAST/github_output" || true)"
+  lines="$(wc -l <"$LAST/github_path")"
+  if [ "$keys" -ne 2 ]; then
+    fail "outputs are written in the random-delimiter form" "expected 2 delimiter key lines (version, path), got $keys"
+  elif [ "$lines" -ne 1 ]; then
+    fail "outputs are written in the random-delimiter form" "expected exactly 1 PATH line, got $lines"
+  elif grep -Eq '^(version|path)=' "$LAST/github_output"; then
+    fail "outputs are written in the random-delimiter form" "unsafe key=value form still present"
+  else
+    pass "outputs are written in the random-delimiter form"
+  fi
+else
+  fail "outputs are written in the random-delimiter form" "exit $STATUS"
+fi
+
+# ------------------------------------------------------ fetch hardening (#6) --
+# Asserted from the double's observed argv, not by grepping the script: the
+# question is what the action actually passed to curl.
+note "fetch hardening"
+F="$T/fx-flags"
+mkfix "$F" terraform 1.9.5
+ARGV_LOG="$T/curl-argv.log"; : >"$ARGV_LOG"
+export CURL_ARGV_LOG="$ARGV_LOG"
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+unset CURL_ARGV_LOG
+missing=""
+for flag in -- '--proto =https' '--proto-redir =https' '--max-redirs 3' \
+  '--connect-timeout 10' '--max-time 300' '--retry 3' '--retry-all-errors'
+do
+  [ "$flag" = "--" ] && continue
+  while read -r line; do
+    [ -z "$line" ] && continue
+    printf '%s\n' "$line" | grep -q -- "$flag" || missing="$missing [$flag]"
+  done <"$ARGV_LOG"
+done
+if [ -z "$missing" ] && [ -s "$ARGV_LOG" ]; then
+  pass "every fetch is protocol-pinned, bounded and retrying"
+else
+  fail "every fetch is protocol-pinned, bounded and retrying" "missing on some invocation:$missing"
+fi
+
+# The two version-API bodies are read into a command substitution, so they also
+# need a size ceiling. Only those fetches should carry it.
+F="$T/fx-latest-flags"
+mkfix "$F" tofu 1.8.2
+printf '{"tag_name":"v1.8.2"}\n' >"$F/latest"
+LATEST_LOG="$T/curl-argv-latest.log"; : >"$LATEST_LOG"
+export CURL_ARGV_LOG="$LATEST_LOG"
+run_step "$F" "$GOOD_DIR" BINARY=tofu VERSION_IN=latest \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+unset CURL_ARGV_LOG
+if grep -q -- '--max-filesize' "$LATEST_LOG"; then
+  pass "the version-API fetch carries a response size ceiling"
+else
+  fail "the version-API fetch carries a response size ceiling" \
+    "no --max-filesize in: $(head -1 "$LATEST_LOG")"
 fi
 
 note "action manifest"
