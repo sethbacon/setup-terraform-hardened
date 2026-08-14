@@ -717,8 +717,11 @@ note "runner preconditions"
 F="$T/fx-runnertemp"
 mkfix "$F" terraform 1.9.5
 rt="$T/run.rt"; mkdir -p "$rt"; : >"$rt/github_path"; : >"$rt/github_output"
+# `env -u`, not merely omitting it: a real runner has RUNNER_TEMP in the ambient
+# environment, so an assertion that only leaves it out of the explicit list
+# passes locally and proves nothing in CI.
 set +e
-env PATH="$T/bin:$BASE_PATH" FIXTURES="$F" GITHUB_ACTION_PATH="$GOOD_DIR" \
+env -u RUNNER_TEMP PATH="$T/bin:$BASE_PATH" FIXTURES="$F" GITHUB_ACTION_PATH="$GOOD_DIR" \
   GITHUB_PATH="$rt/github_path" GITHUB_OUTPUT="$rt/github_output" GNUPGHOME= \
   BINARY=terraform VERSION_IN=1.9.5 REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false \
   bash "$SCRIPT" >"$rt/out" 2>&1
@@ -726,6 +729,12 @@ STATUS=$?
 set -e
 OUT="$(cat "$rt/out")"
 expect_fail "an unset RUNNER_TEMP fails closed rather than installing into /tmp" \
+  '::error::RUNNER_TEMP is not set'
+
+# `:-` fired when the variable was unset OR EMPTY, so both shapes are cases.
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false RUNNER_TEMP=
+expect_fail "an empty RUNNER_TEMP fails closed rather than installing into /tmp" \
   '::error::RUNNER_TEMP is not set'
 
 PATH_OVERRIDE="$T/bin-nounzip"
