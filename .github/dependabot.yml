@@ -1,0 +1,17 @@
+---
+version: 2
+
+updates:
+  # SHA pinning and automated updates are two halves of one control: the pin
+  # stops a dependency changing under you, and this is what tells you the thing
+  # you pinned has a published fix. Without it the pins in pr-checks.yml and
+  # ci.yml — including a third-party action that is handed GITHUB_TOKEN — freeze
+  # at whatever was current the day they were written. Dependabot rewrites the
+  # SHA and keeps the trailing `# vX.Y.Z` comment in sync, which is also what
+  # zizmor's ref-version-mismatch audit checks.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci(deps)

@@ -38,6 +38,15 @@ inputs:
       opts out of authenticity checking and emits a warning.
     required: false
     default: auto
+  github-token:
+    description: >-
+      Used only for the api.github.com call that resolves version "latest" for
+      OpenTofu. Pass the workflow's github.token. Unauthenticated, that request is capped
+      at 60/hour per source IP — a budget shared with every other tenant on a
+      hosted runner's egress address — so it fails intermittently without one. A
+      contents:read token is enough, and it is sent to api.github.com only.
+    required: false
+    default: ""
 
 outputs:
   version:
@@ -58,6 +67,7 @@ runs:
         REQUIRE_CHECKSUM: ${{ inputs.require-checksum }}
         REQUIRE_GPG: ${{ inputs.require-gpg-signature }}
         REQUIRE_COSIGN: ${{ inputs.require-cosign-verification }}
+        GH_TOKEN_IN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
 
@@ -85,6 +95,49 @@ runs:
         # The two version-API responses are a few KB and are read into a command
         # substitution, i.e. into memory, so they get a size ceiling as well.
         curl_get_small() { curl_get --max-filesize 1048576 "$@"; }
+
+        # Both release feeds are read with grep rather than a JSON parser because
+        # jq is not guaranteed on a self-hosted runner. The pattern has to tolerate
+        # whitespace around the colon: checkpoint-api returns compact JSON, but
+        # api.github.com pretty-prints, so a pattern demanding `"key":"value"`
+        # matched NOTHING there — which made `binary: tofu` with the manifest's own
+        # default `version: latest` fail closed for every consumer, including the
+        # second example in the README.
+        json_string() {
+          grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | cut -d'"' -f4
+        }
+
+        # Unauthenticated api.github.com is 60 requests/hour PER SOURCE IP, and a
+        # hosted runner's egress address is shared with every other tenant, so this
+        # call fails intermittently with a 403 that -s hides. A token raises the
+        # budget to 1000/hour for the repository. It goes into a curl config file
+        # rather than onto the command line, so it never appears in this process's
+        # argv where any other process on a shared self-hosted runner could read it.
+        # The API-version header pins the response contract the parser depends on.
+        gh_api_get() {
+          local cfg="$work/curl-gh.cfg"
+          : >"$cfg"
+          chmod 600 "$cfg"
+          {
+            printf 'header = "Accept: application/vnd.github+json"\n'
+            printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'
+            if [ -n "${GH_TOKEN_IN:-}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN_IN"
+            fi
+          } >>"$cfg"
+          curl_get_small --config "$cfg" "$@"
+        }
+
+        # Only the cosign path used to check that its tool exists; a missing gpg,
+        # unzip or checksum tool died with a bare `command not found` and exit
+        # 127 instead of a diagnosis. macOS is a claimed-supported OS and ships
+        # `shasum`, not GNU `sha256sum` — reading the same `<hex>  <file>` lines —
+        # so accept either rather than declaring darwin supported and failing on it.
+        sha256_check() {
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum -c -
+          else shasum -a 256 -c -
+          fi
+        }
 
         # --- input validation (a typo must not silently disable a check) ---
         case "$BINARY" in terraform|tofu) : ;; *) echo "::error::binary must be 'terraform' or 'tofu'"; exit 1 ;; esac
@@ -116,34 +169,53 @@ runs:
           fi
         fi
 
+        # Checked up front rather than at each call site, so a runner missing a
+        # tool fails before anything is downloaded.
+        command -v unzip >/dev/null 2>&1 || { echo "::error::unzip not found on PATH; the release archives are zip files. Install unzip on the runner."; exit 1; }
+        if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+          echo "::error::neither sha256sum nor shasum found on PATH, so the archive cannot be checksummed. Install GNU coreutils (Linux) or ensure shasum is available (macOS)."
+          exit 1
+        fi
+
         # --- platform mapping (Terraform/OpenTofu use the same os/arch names) ---
         os="$(uname -s | tr '[:upper:]' '[:lower:]')"
         case "$os" in linux) os=linux ;; darwin) os=darwin ;; mingw*|msys*|cygwin*) os=windows ;; *) echo "::error::unsupported OS $os"; exit 1 ;; esac
         arch="$(uname -m)"
         case "$arch" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) echo "::error::unsupported arch $arch"; exit 1 ;; esac
 
-        work="$(mktemp -d)"; cd "$work"
+        work="$(mktemp -d)"
+        # A composite action has no `post:` hook, so without this the archive,
+        # SHA256SUMS, the detached signature and the imported GPG keyring stay
+        # under the temp directory for the rest of the job — and, on a reused
+        # self-hosted runner, past the end of it.
+        trap 'rm -rf "$work"' EXIT
+        cd "$work"
 
         # --- resolve "latest" ---
         version="$VERSION_IN"
         if [ "$version" = "latest" ] || [ -z "$version" ]; then
           if [ "$BINARY" = "terraform" ]; then
-            version="$(curl_get_small https://checkpoint-api.hashicorp.com/v1/check/terraform | grep -o '"current_version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            version="$(curl_get_small https://checkpoint-api.hashicorp.com/v1/check/terraform | json_string current_version)"
           else
-            version="$(curl_get_small https://api.github.com/repos/opentofu/opentofu/releases/latest | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)"
-            version="${version#v}"
+            version="$(gh_api_get https://api.github.com/repos/opentofu/opentofu/releases/latest | json_string tag_name)"
           fi
         fi
+        # One normalization point for both binaries: the tofu branch used to strip
+        # the tag's `v` itself and then have it stripped again here.
         version="${version#v}"
         [ -n "$version" ] || { echo "::error::could not resolve version"; exit 1; }
         # $version is spliced into the download URLs AND written to
         # $GITHUB_OUTPUT, both of which are line-oriented. An action input can
         # legally be multi-line, so assert the shape rather than relying on a
         # later step happening to fail first.
+        # Bracket ranges collate per locale, so this was checked rather than
+        # assumed: under the runner's en_US.UTF-8, bash still refuses a version
+        # carrying an accented letter (verified against C, C.UTF-8 and
+        # en_US.UTF-8), so the class means what it says without an LC_ALL guard.
         case "$version" in
-          *[!A-Za-z0-9._+-]*|"") echo "::error::version must contain only letters, digits, dot, underscore, plus or hyphen (got '$version')"; exit 1 ;;
+          *[!A-Za-z0-9._+-]*|"") printf '::error::version must contain only letters, digits, dot, underscore, plus or hyphen (got %s)\n' "'$version'"; exit 1 ;;
         esac
-        echo "Installing $BINARY $version ($os/$arch)"
+        printf 'Installing %s %s (%s/%s)\n' "$BINARY" "$version" "$os" "$arch"
 
         # --- URLs ---
         if [ "$BINARY" = "terraform" ]; then
@@ -193,18 +265,29 @@ runs:
           command -v cosign >/dev/null 2>&1 || { echo "::error::cosign not found on PATH. Add sigstore/cosign-installer before this step, or set require-cosign-verification: 'false' to install without authenticity checking."; exit 1; }
           curl_get -o "${sums}.sig" "${base}/${sums}.sig" || { echo "::error::could not download ${sums}.sig; SHA256SUMS cannot be authenticated"; exit 1; }
           curl_get -o "${sums}.pem" "${base}/${sums}.pem" || { echo "::error::could not download ${sums}.pem; SHA256SUMS cannot be authenticated"; exit 1; }
+          # Every other failure in this script surfaces as a ::error:: annotation;
+          # without this wrapper the single most important failure in it — a
+          # signature that does not verify — reached the Checks UI as nothing but
+          # cosign's own stderr and a non-zero exit.
           cosign verify-blob \
             --certificate "${sums}.pem" \
             --signature "${sums}.sig" \
             --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
             --certificate-oidc-issuer "$COSIGN_ISSUER" \
-            "$sums"
+            "$sums" || { echo "::error::cosign verification of ${sums} failed"; exit 1; }
           echo "cosign verification OK"
         fi
 
         # --- checksum: the only link between the authenticated SHA256SUMS and the archive ---
         if [ "$REQUIRE_CHECKSUM" = "true" ]; then
-          grep " ${zip}\$" "$sums" | sha256sum -c -
+          # $zip is DATA, not a pattern. As a grep basic regular expression its
+          # dots matched any character, and `[`, `*` or `\` in a version — all
+          # legal input, only some of them excluded by the shape check above —
+          # changed which SHA256SUMS line was selected or aborted grep outright.
+          # awk compares the field as a fixed string. The `*` form is what
+          # sha256sum writes for a binary-mode entry.
+          awk -v f="$zip" '$2 == f || $2 == "*" f { print; found = 1 } END { exit !found }' "$sums" \
+            | sha256_check || { echo "::error::checksum verification of ${zip} against ${sums} failed"; exit 1; }
           echo "checksum OK"
         fi
 
@@ -223,9 +306,17 @@ runs:
         rm -rf "$work/x"
         unzip -o -q "$zip" -d "$work/x"
         [ -f "$work/x/$exe" ] || { echo "::error::archive did not contain the expected ${exe} binary"; exit 1; }
-        dest="${RUNNER_TEMP:-/tmp}/${BINARY}-${version}"
+        # `:-` fires when RUNNER_TEMP is unset OR EMPTY, and the fallback was
+        # /tmp — a world-writable directory, at a path derivable from the two
+        # inputs, that the next line then prepends to the PATH of every later
+        # step. Hosted runners always set it; container jobs with a trimmed
+        # environment and local runners (act) may not. Fail closed instead: this
+        # action installs into RUNNER_TEMP or not at all.
+        [ -n "${RUNNER_TEMP:-}" ] || { echo "::error::RUNNER_TEMP is not set. Refusing to fall back to a predictable world-writable path such as /tmp."; exit 1; }
+        dest="${RUNNER_TEMP}/${BINARY}-${version}"
         rm -rf "$dest"
         mkdir -p "$dest"
+        chmod 0755 "$dest"
         install -m 0755 "$work/x/$exe" "$dest/$exe"
 
         # $GITHUB_PATH is parsed line by line and has no delimiter form, so a

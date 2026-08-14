@@ -16,6 +16,7 @@ PATH. No CLI wrapper is installed, so raw exit codes (e.g.
 | `require-checksum` | `true` | compare the archive against the published `SHA256SUMS`; always performed when a signature is verified |
 | `require-gpg-signature` | `auto` | **Terraform only** — verify `SHA256SUMS` with HashiCorp's GPG key. `auto` means `true` for `terraform`, `false` for `tofu` |
 | `require-cosign-verification` | `auto` | **OpenTofu only** — verify `SHA256SUMS` with cosign. `auto` means `true` for `tofu`, `false` for `terraform`. Requires `cosign` on PATH |
+| `github-token` | `""` | only used to resolve `version: latest` for OpenTofu. Pass `${{ github.token }}` — see [Rate limiting](#rate-limiting) |
 
 Each input accepts only the values listed; anything else is an error rather than a
 silently disabled check.
@@ -52,6 +53,18 @@ a `::warning::` on every run.
 | `version` | resolved version installed |
 | `path` | install directory (also added to PATH) |
 
+Both are safe to interpolate into a later `run:` block. That is a property of the
+action, not an accident: with `version: latest` the version string arrives from a
+network response, so it is asserted to contain only letters, digits, `.`, `_`,
+`+` and `-` before it is written to `$GITHUB_OUTPUT`, and the install path is
+rejected if it carries anything outside that set plus `/`. Neither can carry a
+newline, a quote or a shell metacharacter into your workflow.
+
+If you install the **same binary twice in one job** at two different versions,
+both install directories end up on `PATH` and a bare `terraform` resolves to
+whichever `$GITHUB_PATH` prepended last. Reference `steps.<id>.outputs.path`
+explicitly in that case — the outputs are per-step and unambiguous.
+
 ## Examples
 
 ```yaml
@@ -64,6 +77,83 @@ a `::warning::` on every run.
 - uses: sethbacon/setup-terraform-hardened@v1
   with: { binary: tofu, version: latest }
 ```
+
+## Network egress
+
+If you run this action behind an egress allow-list (`step-security/harden-runner`
+in block mode, a corporate proxy, or a restrictive NAT policy), this is the
+complete set of hosts it contacts. An allow-list built from the examples above
+rather than from this table is how a hardened runner ends up with the policy
+turned off.
+
+| Host | When |
+|------|------|
+| `checkpoint-api.hashicorp.com` | only `binary: terraform` with `version: latest` |
+| `api.github.com` | only `binary: tofu` with `version: latest` |
+| `releases.hashicorp.com` | every `binary: terraform` run (archive, `SHA256SUMS`, `.sig`) |
+| `github.com` | every `binary: tofu` run — issues the download, then redirects |
+| `release-assets.githubusercontent.com` | the redirect target that actually serves OpenTofu assets. GitHub has changed this host before; it appears in no source file here |
+| `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` | reached by `cosign verify-blob`, not by this action, whenever cosign verification runs |
+
+No GPG key is fetched at run time — HashiCorp's is vendored at
+[`keys/hashicorp.asc`](keys/hashicorp.asc).
+
+Pinning an explicit `version` removes the first two rows entirely. Note that
+`checkpoint-api.hashicorp.com` is HashiCorp's version-check/telemetry endpoint,
+so a default-configured `binary: terraform` run reports in to it.
+
+### Rate limiting
+
+The OpenTofu `latest` lookup calls `api.github.com`. Unauthenticated, that is
+capped at **60 requests/hour per source IP** — and a hosted runner's egress
+address is shared with every other tenant on it, so the call fails intermittently
+with a 403. Pass a token to raise it to 1,000/hour for your repository:
+
+```yaml
+- uses: sethbacon/setup-terraform-hardened@v1
+  with:
+    binary: tofu
+    version: latest
+    github-token: ${{ github.token }}
+```
+
+`contents: read` is sufficient, and the token is sent to `api.github.com` and
+nowhere else. It is passed to curl through a config file rather than on the
+command line, so it does not appear in the process's arguments.
+
+### `version: latest` trusts an unauthenticated feed
+
+`latest` is resolved from `checkpoint-api.hashicorp.com` (Terraform) or
+`api.github.com` (OpenTofu). Neither response is signed, and **none of the three
+verification controls detects a rollback**: an attacker who can influence that
+response names an older version, and the action then downloads a genuine,
+correctly checksummed, correctly signed release of it. Checksum, GPG and cosign
+all establish authenticity; none of them establishes freshness. The resolved
+version is logged on every run (`Installing terraform 1.9.5 (linux/amd64)`).
+
+For production workflows, pin an explicit `version`.
+
+## Differences from the upstream actions
+
+This action is deliberately narrower than
+[`hashicorp/setup-terraform`](https://github.com/hashicorp/setup-terraform) and
+[`opentofu/setup-opentofu`](https://github.com/opentofu/setup-opentofu). If you
+are migrating from either:
+
+- **No version constraint syntax.** `version` takes an exact version or
+  `latest`; ranges such as `~1.1.0` or `<1.2.0` are not parsed.
+- **No tool caching.** Every run downloads and verifies the release. There is no
+  `cache` input and no use of the Actions tool cache.
+- **No `*_version_file` input.**
+- **No CLI wrapper.** `hashicorp/setup-terraform` installs a wrapper that
+  captures stdout/stderr and changes exit codes; this action does not, which is
+  the point — `plan -detailed-exitcode` keeps its raw exit code.
+- **No credentials handling.** `cli_config_credentials_token` has no equivalent
+  here.
+
+What it adds in exchange is the verification described above: a vendored,
+pinned GPG trust root, cosign verification against the OpenTofu release
+identity, and defaults that fail closed.
 
 Sources: Terraform from `releases.hashicorp.com`; OpenTofu from the
 `opentofu/opentofu` GitHub releases.

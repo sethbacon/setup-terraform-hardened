@@ -29,3 +29,101 @@ jobs:
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       - name: Run action script tests
         run: tests/run-tests.sh
+
+  # The implementation is ~200 lines of quoting-sensitive bash inside a YAML
+  # block scalar, which is invisible to shellcheck unless it is deliberately
+  # extracted — so nothing here had ever linted it. actionlint covers the
+  # workflows themselves, where an unpinned `uses:` or a missing `permissions:`
+  # block is the sort of thing a human review misses and a linter never does.
+  lint:
+    name: Lint the workflows and the embedded script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Release assets verified against their published digest before use, rather
+      # than piping an install script into a shell — the same standard this
+      # action applies to what it downloads.
+      - name: Install actionlint and shellcheck
+        run: |
+          set -euo pipefail
+          curl -sSfLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c -
+          tar xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+          curl -sSfL -o shellcheck.tar.xz https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz
+          echo "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87  shellcheck.tar.xz" | sha256sum -c -
+          tar xJf shellcheck.tar.xz shellcheck-v0.10.0/shellcheck
+          echo "$PWD" >> "$GITHUB_PATH"
+          echo "$PWD/shellcheck-v0.10.0" >> "$GITHUB_PATH"
+
+      - name: actionlint
+        run: ./actionlint -color
+
+      - name: shellcheck the step script extracted from action.yml
+        run: |
+          set -euo pipefail
+          python3 - action.yml > /tmp/install.sh <<'PY'
+          import sys, yaml
+          doc = yaml.safe_load(open(sys.argv[1]))
+          step = [s for s in doc["runs"]["steps"] if s.get("id") == "install"][0]
+          sys.stdout.write("#!/usr/bin/env bash\n" + step["run"])
+          PY
+          shellcheck -s bash /tmp/install.sh
+
+  # The behaviour suite drives the script directly. This job is the only thing
+  # that proves the ACTION works — that `uses:` resolves it, that the binary it
+  # installs is reachable on PATH from a later step, and that the two documented
+  # outputs carry what the README says they carry.
+  #
+  # The tofu leg deliberately uses `version: latest` against the live GitHub API.
+  # That combination — the manifest's own default for half the action's surface —
+  # was broken for every consumer and no test could see it, because the only
+  # fixture for the release feed was compact JSON and the live endpoint
+  # pretty-prints.
+  consumer:
+    name: Consume the action end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install terraform (GPG-verified, pinned version)
+        id: tf
+        uses: ./
+        with:
+          binary: terraform
+          version: 1.9.5
+
+      - name: terraform is on PATH and the outputs describe it
+        env:
+          TF_VERSION: ${{ steps.tf.outputs.version }}
+          TF_PATH: ${{ steps.tf.outputs.path }}
+        run: |
+          set -euo pipefail
+          test "$TF_VERSION" = "1.9.5"
+          test -x "$TF_PATH/terraform"
+          terraform version | head -1 | grep -q "v$TF_VERSION"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Install tofu (cosign-verified, resolved from the live release feed)
+        id: tofu
+        uses: ./
+        with:
+          binary: tofu
+          version: latest
+          github-token: ${{ github.token }}
+
+      - name: tofu is on PATH and the outputs describe it
+        env:
+          TOFU_VERSION: ${{ steps.tofu.outputs.version }}
+          TOFU_PATH: ${{ steps.tofu.outputs.path }}
+        run: |
+          set -euo pipefail
+          test -n "$TOFU_VERSION"
+          test -x "$TOFU_PATH/tofu"
+          tofu version | head -1 | grep -q "v$TOFU_VERSION"
