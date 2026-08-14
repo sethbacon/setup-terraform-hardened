@@ -438,8 +438,11 @@ expect_ok "good path: cosign verification against the OpenTofu release identity"
 
 run_default "$F" "$GOOD_DIR" tofu "$V" \
   COSIGN_FAKE_IDENTITY="$TOFU_ID" COSIGN_FAKE_FAIL=1
-expect_fail "failed cosign verification stops the install" \
-  'cosign-double: signature verification failed'
+# The annotation, not just the exit status: a supply-chain verification failure
+# that reaches the Checks UI as nothing but a tool's stderr is the one failure
+# in this script a consumer most needs named.
+expect_fail "failed cosign verification stops the install with an annotation" \
+  '::error::cosign verification of tofu_9\.9\.9_SHA256SUMS failed'
 
 for bad in \
   'https://github.com/opentofu/opentofu-evil/.github/workflows/release.yml@refs/heads/v9.9' \
@@ -635,6 +638,130 @@ if grep -q -- '--max-filesize' "$LATEST_LOG"; then
 else
   fail "the version-API fetch carries a response size ceiling" \
     "no --max-filesize in: $(head -1 "$LATEST_LOG")"
+fi
+
+# --------------------------------------------------- release-feed parsing (#5) --
+# checkpoint-api returns compact JSON; api.github.com PRETTY-PRINTS. A pattern
+# written for the compact shape matched nothing against the pretty one, and the
+# only fixture in this suite was compact — so the suite could not tell a working
+# parser from one that fails for every `binary: tofu` + `version: latest`
+# consumer, which is the manifest's own default.
+note "release-feed parsing"
+WITH_COSIGN=0
+F="$T/fx-latest-pretty"
+mkfix "$F" tofu 1.8.2
+printf '{\n  "url": "https://api.github.com/repos/opentofu/opentofu/releases/1",\n  "tag_name": "v1.8.2",\n  "name": "v1.8.2"\n}\n' >"$F/latest"
+run_step "$F" "$GOOD_DIR" BINARY=tofu VERSION_IN=latest \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=auto REQUIRE_COSIGN=false
+expect_ok "pretty-printed release JSON resolves 'latest' (the shape api.github.com returns)" \
+  'Installing tofu 1\.8\.2' 'Installed tofu 1\.8\.2'
+
+# The compact shape must keep working: checkpoint-api still returns it.
+F="$T/fx-latest-compact"
+mkfix "$F" terraform 1.8.2
+printf '{"product":"terraform","current_version":"1.8.2","current_release":1783532758}\n' >"$F/terraform"
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=latest \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=auto
+expect_ok "compact release JSON resolves 'latest' (the shape checkpoint-api returns)" \
+  'Installing terraform 1\.8\.2' 'Installed terraform 1\.8\.2'
+
+# The token must not be reachable from another process's view of this one.
+F="$T/fx-latest-token"
+mkfix "$F" tofu 1.8.2
+# Compact on purpose, so this case fails only for a token-handling regression and
+# not also for a parser one.
+printf '{"tag_name":"v1.8.2"}\n' >"$F/latest"
+TOKEN_LOG="$T/curl-argv-token.log"; : >"$TOKEN_LOG"
+export CURL_ARGV_LOG="$TOKEN_LOG"
+run_step "$F" "$GOOD_DIR" BINARY=tofu VERSION_IN=latest \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=auto REQUIRE_COSIGN=false \
+  GH_TOKEN_IN=ghs_SENTINELTOKENVALUE
+unset CURL_ARGV_LOG
+if [ "$STATUS" -eq 0 ] && ! grep -q 'SENTINELTOKENVALUE' "$TOKEN_LOG" && grep -q -- '--config' "$TOKEN_LOG"; then
+  pass "github-token never appears in curl's argv"
+else
+  fail "github-token never appears in curl's argv" \
+    "exit $STATUS; argv log: $(head -2 "$TOKEN_LOG" | tr '\n' '|')"
+fi
+
+# ------------------------------------------------- checksum line selection (#6) --
+# $zip was interpolated into a grep BRE, so its dots matched any character. A
+# SHA256SUMS carrying a near-miss filename therefore selected two lines, and the
+# whole run failed on the decoy rather than verifying the real archive.
+note "checksum line selection"
+F="$T/fx-decoy"
+mkfix "$F" terraform 1.9.5
+{
+  printf '%s  terraform_1x9y5_%s_%s.zip\n' "$(printf 'd%.0s' $(seq 64))" "$OS" "$ARCH"
+  cat "$F/terraform_1.9.5_SHA256SUMS"
+} >"$F/sums.new"
+mv "$F/sums.new" "$F/terraform_1.9.5_SHA256SUMS"
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+expect_ok "a near-miss filename in SHA256SUMS does not change which line is verified" \
+  'checksum OK' 'Installed terraform 1\.9\.5'
+
+F="$T/fx-nosuchline"
+mkfix "$F" terraform 1.9.5
+: >"$F/terraform_1.9.5_SHA256SUMS"
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+expect_fail "a SHA256SUMS with no entry for the archive fails with an annotation" \
+  '::error::checksum verification of terraform_1\.9\.5'
+
+# ------------------------------------------------------- runner preconditions --
+# The install directory is prepended to the PATH of every later step, so the
+# fallback that used to fire here put a predictable path inside a world-writable
+# directory at the front of it.
+note "runner preconditions"
+F="$T/fx-runnertemp"
+mkfix "$F" terraform 1.9.5
+rt="$T/run.rt"; mkdir -p "$rt"; : >"$rt/github_path"; : >"$rt/github_output"
+# `env -u`, not merely omitting it: a real runner has RUNNER_TEMP in the ambient
+# environment, so an assertion that only leaves it out of the explicit list
+# passes locally and proves nothing in CI.
+set +e
+env -u RUNNER_TEMP PATH="$T/bin:$BASE_PATH" FIXTURES="$F" GITHUB_ACTION_PATH="$GOOD_DIR" \
+  GITHUB_PATH="$rt/github_path" GITHUB_OUTPUT="$rt/github_output" GNUPGHOME= \
+  BINARY=terraform VERSION_IN=1.9.5 REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false \
+  bash "$SCRIPT" >"$rt/out" 2>&1
+STATUS=$?
+set -e
+OUT="$(cat "$rt/out")"
+expect_fail "an unset RUNNER_TEMP fails closed rather than installing into /tmp" \
+  '::error::RUNNER_TEMP is not set'
+
+# `:-` fired when the variable was unset OR EMPTY, so both shapes are cases.
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false RUNNER_TEMP=
+expect_fail "an empty RUNNER_TEMP fails closed rather than installing into /tmp" \
+  '::error::RUNNER_TEMP is not set'
+
+PATH_OVERRIDE="$T/bin-nounzip"
+mkdir -p "$T/bin-nounzip"
+for t in bash env cat cp basename uname tr mktemp grep head cut awk sha256sum mkdir chmod install rm; do
+  p="$(command -v "$t" || true)"
+  [ -n "$p" ] && ln -sf "$p" "$T/bin-nounzip/$t"
+done
+run_step "$F" "$GOOD_DIR" BINARY=terraform VERSION_IN=1.9.5 \
+  REQUIRE_CHECKSUM=true REQUIRE_GPG=false REQUIRE_COSIGN=false
+expect_fail "a missing unzip is diagnosed instead of dying as 'command not found'" \
+  '::error::unzip not found on PATH'
+PATH_OVERRIDE=""
+
+# A composite action has no post: hook, so the only thing that removes the
+# downloaded archive, SHA256SUMS and the imported keyring is the EXIT trap.
+F="$T/fx-cleanup"
+mkfix "$F" terraform "$V"
+sign_sums "$F" "terraform_${V}_SHA256SUMS" good@test.invalid
+use_pin "$GOOD_FPR"
+SCRATCH="$T/scratch-tmp"; rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
+run_default "$F" "$GOOD_DIR" terraform "$V" TMPDIR="$SCRATCH"
+if [ "$STATUS" -eq 0 ] && [ -z "$(ls -A "$SCRATCH")" ]; then
+  pass "the work directory (archive, sums, keyring) is removed when the step exits"
+else
+  fail "the work directory (archive, sums, keyring) is removed when the step exits" \
+    "exit $STATUS; left behind: $(ls -A "$SCRATCH" | tr '\n' ' ')"
 fi
 
 note "action manifest"
