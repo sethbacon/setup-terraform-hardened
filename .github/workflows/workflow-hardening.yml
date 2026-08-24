@@ -26,6 +26,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # zizmor audits workflow SECURITY (credential persistence, template injection,
+  # unpinned refs); the hardening gate below audits workflow HARDENING. Same
+  # family, different questions, and this repository ships a GitHub Action, so
+  # workflow-security lint is more directly relevant here than in most of the
+  # nine repositories that already run it.
+  #
+  # Taken from shared-workflows rather than run locally on purpose. Five repos in
+  # this estate invoke zizmor-action directly and leave `advanced-security` at its
+  # default of true, which selects --format=sarif -- where zizmor EXITS 0 WHATEVER
+  # IT FINDS. Their "Scan Workflows (zizmor)" check is green by construction:
+  # terraform-drift-contract's is green right now with three findings open as code
+  # scanning alerts. The shared definition sets advanced-security: false, so it
+  # fails the build instead of filing a report nobody reads.
+  workflow-security:
+    uses: 4cloudguru/shared-workflows/.github/workflows/workflow-security.yml@9276df8e0bdb3152e2529ab98c8b99cfb9e22d4b # v1.13.0
+
   workflow-hardening:
     uses: 4cloudguru/shared-workflows/.github/workflows/workflow-hardening.yml@9276df8e0bdb3152e2529ab98c8b99cfb9e22d4b # v1.13.0
     with:
