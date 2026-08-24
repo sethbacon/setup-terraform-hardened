@@ -68,7 +68,23 @@ runs:
         REQUIRE_GPG: ${{ inputs.require-gpg-signature }}
         REQUIRE_COSIGN: ${{ inputs.require-cosign-verification }}
         GH_TOKEN_IN: ${{ inputs.github-token }}
-      run: |
+      # This action's entire purpose is to put a verified terraform binary on
+      # PATH, so the $GITHUB_PATH write at the foot of this script is the
+      # deliverable, not an incidental side effect. zizmor flags every write to
+      # that file and rates its own confidence Low for exactly that reason.
+      #
+      # What makes it safe sits above it rather than being asserted here: the
+      # archive is checksum-verified against a pinned trust root, optionally GPG-
+      # and cosign-verified, extracted to a SCRATCH directory, and only the single
+      # binary this action claims to install is copied into $dest. $dest is
+      # constructed by this script and never taken from an input, so the directory
+      # being prepended holds one known-good file.
+      #
+      # The risk zizmor points at is real in general -- $GITHUB_PATH PREPENDS, so
+      # $dest shadows /usr/bin for every later step in the consumer job -- and it
+      # is precisely why the install is narrowed to one binary instead of
+      # extracting the archive straight into $dest.
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
 
         # --- pinned trust roots ---
