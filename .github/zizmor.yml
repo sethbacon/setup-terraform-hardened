@@ -1,0 +1,19 @@
+# zizmor configuration.
+#
+# The ignore lives here rather than as a `# zizmor: ignore[...]` comment on the
+# `run:` key, and that is not a style preference. zizmor requires the directive
+# on the line a finding ANCHORS to, which for a multi-line script is the
+# `run: |` key itself -- and `run: | # zizmor: ignore[github-env]`, while valid
+# YAML, is not parseable by the `action-artifact-trust` signature that
+# security-orchestration replays against this repository. That signature uses a
+# hand-rolled block-YAML reader; a comment after the `|` block indicator shifts
+# every line it reports afterwards and it exits 2 (could-not-run) rather than 0
+# or 1. Bisected: the comment block above `run:` is fine, the trailing comment
+# is not.
+rules:
+  github-env:
+    ignore:
+      # The $GITHUB_PATH write is this action's deliverable, not a side effect --
+      # see the comment above the `run:` key in action.yml for why the value
+      # being prepended is safe.
+      - action.yml
