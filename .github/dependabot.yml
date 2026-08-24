@@ -13,5 +13,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # zizmor dependabot-cooldown: the implicit default is 3 days; 7 is the
+    # estate standard and what the audit requires. Security updates are exempt
+    # from cooldown, so this delays feature bumps, not fixes.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: ci(deps)

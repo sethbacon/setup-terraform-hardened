@@ -68,6 +68,18 @@ runs:
         REQUIRE_GPG: ${{ inputs.require-gpg-signature }}
         REQUIRE_COSIGN: ${{ inputs.require-cosign-verification }}
         GH_TOKEN_IN: ${{ inputs.github-token }}
+      # zizmor's github-env audit fires on the $GITHUB_PATH write at the foot of
+      # this script. Putting a verified binary on PATH is what this action IS, so
+      # that write is the deliverable rather than an incidental side effect, and
+      # zizmor rates its own confidence Low for exactly that reason. The ignore is
+      # declared in .github/zizmor.yml; the justification is here, next to the code
+      # it excuses.
+      #
+      # What makes it safe is the code above: the archive is checksum-verified
+      # against a pinned trust root, optionally GPG- and cosign-verified, extracted
+      # to a SCRATCH directory, and only the single binary this action claims to
+      # install is copied into $dest. $dest is built by this script and never taken
+      # from an input, so the directory being prepended holds one known-good file.
       run: |
         set -euo pipefail
 
