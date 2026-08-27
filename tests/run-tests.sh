@@ -818,5 +818,68 @@ else
   fi
 fi
 
+# ------------------------------------------------------- SIGPIPE under pipefail --
+# An early-exiting READER under `set -o pipefail` is an intermittent exit 141:
+# it closes the pipe once it has what it needs, and any LATER write upstream
+# takes SIGPIPE. It only bites when the writer's output is split across writes
+# with a gap between them -- `terraform version` writes its version line,
+# consults the upgrade-notice service, then writes the platform line -- so it
+# reads as flake rather than breakage. It failed this repo's own CI twice on
+# 2026-08-24, passing in between, and left main red for three days.
+#
+# Early-exiting readers: `head -N`, `grep -q`, `grep -m N`.
+# `tail -N` is NOT one -- it must consume to EOF to know which lines are last,
+# so it never closes early. Flagging it would be a false positive; the sibling
+# repo terraform-drift-contract has a legitimate `npm pack | tail -n1`.
+# A `printf`/`echo` writer is likewise exempt: one small buffered write always
+# completes before the reader can exit.
+#
+# Scanned as text on purpose: the defect is the SHAPE of the pipeline, and every
+# file here that runs under pipefail is shell embedded in YAML, which no shell
+# linter reads.
+sigpipe_scan() {
+  grep -rnE '\|[[:space:]]*(head[[:space:]]+-|grep([[:space:]]+-[a-zA-Z]*)*[[:space:]]+-(q|m)\b)' "$@" 2>/dev/null \
+    | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' \
+    | grep -vE '(printf|echo)[^|]*\|' || true
+}
+
+note "no SIGPIPE-prone pipelines under pipefail"
+# Count the universe before trusting a clean result. A mis-pathed or emptied
+# scan produces no hits and is indistinguishable from a repo with no defects --
+# the exact way this guard was observed to pass while examining nothing.
+sigpipe_targets="$REPO_ROOT/action.yml $REPO_ROOT/.github/workflows"
+# shellcheck disable=SC2086  # deliberate word-splitting: two search roots
+sigpipe_files=$(find $sigpipe_targets -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | wc -l || true)
+sigpipe_hits=$(sigpipe_scan "$REPO_ROOT/action.yml" "$REPO_ROOT/.github/workflows")
+if [ "$sigpipe_files" -lt 3 ]; then
+  fail "no SIGPIPE-prone pipelines under pipefail" \
+    "scanned $sigpipe_files file(s) -- the universe is empty or mis-pathed, so a clean result means nothing"
+elif [ -n "$sigpipe_hits" ]; then
+  fail "no SIGPIPE-prone pipelines under pipefail" "$sigpipe_hits"
+else
+  pass "no SIGPIPE-prone pipelines under pipefail ($sigpipe_files files scanned)"
+fi
+
+# Guards the guard, in BOTH directions, with each probe carrying EXACTLY ONE
+# shape. A probe holding both (`cmd | head -1 | grep -q x`) still matches after
+# the scanner is blinded to one of them, so it cannot show which branch works --
+# that mistake made an earlier version of this test certify a blind scanner.
+sigpipe_probe="$T/sigpipe-probe"
+mkdir -p "$sigpipe_probe"
+printf 'run: |\n  set -euo pipefail\n  terraform version | head -1\n' >"$sigpipe_probe/bad-head.yml"
+printf 'run: |\n  set -euo pipefail\n  some_cmd | grep -q x\n'        >"$sigpipe_probe/bad-grepq.yml"
+printf 'run: |\n  set -euo pipefail\n  npm pack --silent | tail -n1\n' >"$sigpipe_probe/ok-tail.yml"
+printf 'run: |\n  set -euo pipefail\n  printf "%%s" "$x" | grep -q y\n' >"$sigpipe_probe/ok-printf.yml"
+
+sigpipe_head=$(sigpipe_scan "$sigpipe_probe/bad-head.yml")
+sigpipe_grepq=$(sigpipe_scan "$sigpipe_probe/bad-grepq.yml")
+sigpipe_safe=$(sigpipe_scan "$sigpipe_probe/ok-tail.yml" "$sigpipe_probe/ok-printf.yml")
+if [ -n "$sigpipe_head" ] && [ -n "$sigpipe_grepq" ] && [ -z "$sigpipe_safe" ]; then
+  pass "the SIGPIPE scanner catches head and grep -q, and neither safe shape"
+else
+  fail "the SIGPIPE scanner catches head and grep -q, and neither safe shape" \
+    "head=[$sigpipe_head] grepq=[$sigpipe_grepq] safe=[$sigpipe_safe]"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
