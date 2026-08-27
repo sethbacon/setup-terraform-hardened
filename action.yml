@@ -116,7 +116,10 @@ runs:
         # default `version: latest` fail closed for every consumer, including the
         # second example in the README.
         json_string() {
-          grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | cut -d'"' -f4
+          # `sed -n 1p`, not `head -1`: head exits after the first line, which SIGPIPEs
+          # grep, and the `set -o pipefail` above turns that into exit 141 for this
+          # function. sed reads to EOF, so nothing upstream is ever signalled.
+          grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed -n '1p' | cut -d'"' -f4
         }
 
         # Unauthenticated api.github.com is 60 requests/hour PER SOURCE IP, and a
