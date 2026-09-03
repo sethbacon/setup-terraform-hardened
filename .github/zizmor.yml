@@ -17,3 +17,15 @@ rules:
       # see the comment above the `run:` key in action.yml for why the value
       # being prepended is safe.
       - action.yml
+  self-repository:
+    ignore:
+      # The audit asks for GitHub's `uses: $/...` form in place of `uses: ./...`.
+      # actionlint rejects `$/` outright -- it is not one of the two `uses`
+      # shapes it accepts -- and actionlint is a required check here via the
+      # shared workflow-security gate, so the remediation cannot be applied
+      # without failing a different required gate. Attempted and proven in
+      # 4cloudguru/shared-workflows#46: `$/` resolved correctly at runtime and
+      # actionlint still failed it. Upstream support is requested in
+      # rhysd/actionlint#711. Tracked as 4cloudguru/shared-workflows#45; this
+      # entry comes out when actionlint accepts the syntax.
+      - ci.yml
